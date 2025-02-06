@@ -30,7 +30,7 @@ define i32 @guards_applied_to_add_rec(ptr %dst) {
 ; CHECK-NEXT:    br label %[[OUTER_LATCH]]
 ; CHECK:       [[OUTER_LATCH]]:
 ; CHECK-NEXT:    [[OUTER_IV_0_NEXT]] = add nuw i32 [[OUTER_IV_0]], 1
-; CHECK-NEXT:    [[EXITCOND:%.*]] = icmp ne i32 [[OUTER_IV_0_NEXT]], -2147483647
+; CHECK-NEXT:    [[EXITCOND:%.*]] = icmp sgt i32 [[OUTER_IV_0]], 0
 ; CHECK-NEXT:    br i1 [[EXITCOND]], label %[[OUTER_HEADER]], label %[[EXIT:.*]]
 ; CHECK:       [[EXIT]]:
 ; CHECK-NEXT:    ret i32 0
