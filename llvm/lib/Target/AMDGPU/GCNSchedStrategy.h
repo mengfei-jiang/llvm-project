@@ -14,12 +14,13 @@
 #define LLVM_LIB_TARGET_AMDGPU_GCNSCHEDSTRATEGY_H
 
 #include "GCNRegPressure.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
 #include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/ADT/PriorityWorklist.h"
+#include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineScheduler.h"
 
 namespace llvm {
@@ -42,6 +43,23 @@ enum class GCNSchedStageID : unsigned {
 #ifndef NDEBUG
 raw_ostream &operator<<(raw_ostream &OS, const GCNSchedStageID &StageID);
 #endif
+
+// Tracks the number of cycles that a resource is occupied. Requires top-down
+// scheduling.
+struct ProcRes {
+  unsigned CyclesReserved = 0;
+
+  void reset() { CyclesReserved = 0; }
+
+  void reserve(unsigned Cycles) { CyclesReserved += Cycles; }
+
+  void release(unsigned Cycles) {
+    if (Cycles > CyclesReserved)
+      CyclesReserved = 0;
+    else
+      CyclesReserved -= Cycles;
+  }
+};
 
 /// This is a minimal scheduler strategy.  The main difference between this
 /// and the GenericScheduler is that GCNSchedStrategy uses different
@@ -73,6 +91,10 @@ protected:
 
   void printCandidateDecision(const SchedCandidate &Current,
                               const SchedCandidate &Preferred);
+  // If the XDL resource is not occupied, try to schedule a ready MFMA,
+  // otherwise, try not to stall XDL.
+  bool tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand,
+              SchedBoundary *Zone) const;
 
   std::vector<unsigned> Pressure;
 
@@ -126,6 +148,12 @@ public:
 
   unsigned VGPRLimitBias = 0;
 
+  // Processor resource for XDL.
+  ProcRes XDLProcRes;
+
+  // Use custom resource tracking for scheduling.
+  bool CustomResTracking = false;
+
   GCNSchedStrategy(const MachineSchedContext *C);
 
   SUnit *pickNode(bool &IsTopNode) override;
@@ -158,6 +186,9 @@ class GCNMaxOccupancySchedStrategy final : public GCNSchedStrategy {
 public:
   GCNMaxOccupancySchedStrategy(const MachineSchedContext *C,
                                bool IsLegacyScheduler = false);
+
+  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand,
+                    SchedBoundary *Zone) const override;
 };
 
 /// The goal of this scheduling strategy is to maximize ILP for a single wave
@@ -202,7 +233,8 @@ public:
 };
 
 inline raw_ostream &operator<<(raw_ostream &OS, const ScheduleMetrics &Sm) {
-  dbgs() << "\n Schedule Metric (scaled by " << ScheduleMetrics::ScaleFactor
+  dbgs() << "\n Schedule Metric (scaled by "
+         << ScheduleMetrics::ScaleFactor
          << " ) is: " << Sm.getMetric() << " [ " << Sm.getBubbles() << "/"
          << Sm.getLength() << " ]\n";
   return OS;
@@ -228,7 +260,7 @@ public:
 
   // Retrieve the LiveReg for a given RegionIdx
   GCNRPTracker::LiveRegSet &getLiveRegsForRegionIdx(unsigned RegionIdx) {
-    assert(IdxToInstruction.contains(RegionIdx));
+    assert(IdxToInstruction.find(RegionIdx) != IdxToInstruction.end());
     MachineInstr *Key = IdxToInstruction[RegionIdx];
     return RegionLiveRegMap[Key];
   }
@@ -260,7 +292,8 @@ class GCNScheduleDAGMILive final : public ScheduleDAGMILive {
   unsigned MinOccupancy;
 
   // Vector of regions recorder for later rescheduling
-  SmallVector<RegionBoundaries, 32> Regions;
+  SmallVector<std::pair<MachineBasicBlock::iterator,
+                        MachineBasicBlock::iterator>, 32> Regions;
 
   // Record regions with high register pressure.
   BitVector RegionsWithHighRP;
@@ -306,6 +339,12 @@ class GCNScheduleDAGMILive final : public ScheduleDAGMILive {
 
   /// Makes the scheduler try to achieve an occupancy of \p TargetOccupancy.
   void setTargetOccupancy(unsigned TargetOccupancy);
+
+  // Update region boundaries when removing MI or inserting NewMI before MI.
+  void updateRegionBoundaries(
+      SmallVectorImpl<std::pair<MachineBasicBlock::iterator,
+                                MachineBasicBlock::iterator>> &RegionBoundaries,
+      MachineBasicBlock::iterator MI, MachineInstr *NewMI);
 
   void runSchedStages();
 
@@ -368,11 +407,11 @@ public:
   // be skipped.
   virtual bool initGCNRegion();
 
-  // Finalize state after scheduling a region.
-  virtual void finalizeGCNRegion();
-
   // Track whether a new region is also a new MBB.
   void setupNewBlock();
+
+  // Finalize state after scheudling a region.
+  void finalizeGCNRegion();
 
   // Check result of scheduling.
   void checkScheduling();
@@ -399,11 +438,11 @@ public:
   bool mayCauseSpilling(unsigned WavesAfter);
 
   /// Sets the schedule of region \p RegionIdx in block \p MBB to \p MIOrder.
-  /// The MIs in \p MIOrder must be exactly the same as the ones currently
-  /// existing inside the region, only in a different order that honors def-use
-  /// chains.
   void modifyRegionSchedule(unsigned RegionIdx, MachineBasicBlock *MBB,
                             ArrayRef<MachineInstr *> MIOrder);
+
+  // Attempt to revert scheduling for this region.
+  void revertScheduling();
 
   void advanceRegion() { RegionIdx++; }
 
@@ -509,261 +548,449 @@ public:
 };
 
 /// Attempts to reduce function spilling or, if there is no spilling, to
-/// increase function occupancy by one with respect to register usage by sinking
-/// rematerializable instructions to their use. When the stage estimates that
-/// reducing spilling or increasing occupancy is possible, it tries to
-/// rematerialize as few registers as possible to reduce potential negative
+/// increase function occupancy by one with respect to ArchVGPR usage by sinking
+/// rematerializable instructions to their use. When the stage
+/// estimates reducing spilling or increasing occupancy is possible, as few
+/// instructions as possible are rematerialized to reduce potential negative
 /// effects on function latency.
-///
-/// The stage only supports rematerializing registers that meet all of the
-/// following constraints.
-/// 1. The register is virtual and has a single defining instruction.
-/// 2. The single defining instruction is either deemed rematerializable by the
-///    target-independent logic, or if not, has no non-constant and
-///    non-ignorable physical register use.
-/// 3  The register has no virtual register use whose live range would be
-///    extended by the rematerialization.
-/// 4. The register has a single non-debug user in a different region from its
-///    defining region.
-/// 5. The register is not used by or using another register that is going to be
-///    rematerialized.
-class PreRARematStage : public GCNSchedStage {
-private:
-  /// A rematerializable register.
-  struct RematReg {
-    /// Single MI defining the rematerializable register.
-    MachineInstr *DefMI;
-    /// Single user of the rematerializable register.
-    MachineInstr *UseMI;
-    /// Regions in which the register is live-in/live-out/live anywhere.
-    BitVector LiveIn, LiveOut, Live;
-    /// The rematerializable register's lane bitmask.
-    LaneBitmask Mask;
-    /// Defining and using regions.
-    unsigned DefRegion, UseRegion;
+class RematCandidate {
+public:
+  MachineInstr *Def = nullptr;
+  unsigned LoopCost;
+  std::set<unsigned> HighRPRegions;
+  MachineBasicBlock::iterator InsertPt;
 
-    RematReg(MachineInstr *DefMI, MachineInstr *UseMI,
-             GCNScheduleDAGMILive &DAG,
-             const DenseMap<MachineInstr *, unsigned> &MIRegion);
+  bool operator<(const RematCandidate &Other) const {
+    if (LoopCost < Other.LoopCost)
+      return true;
 
-    /// Returns the rematerializable register. Do not call after deleting the
-    /// original defining instruction.
-    Register getReg() const { return DefMI->getOperand(0).getReg(); }
+    if (LoopCost == Other.LoopCost) {
+      if (Def < Other.Def)
+        return true;
 
-    /// Determines whether this rematerialization may be beneficial in at least
-    /// one target region.
-    bool maybeBeneficial(const BitVector &TargetRegions,
-                         ArrayRef<GCNRPTarget> RPTargets) const;
-
-    /// Determines if the register is both unused and live-through in region \p
-    /// I. This guarantees that rematerializing it will reduce RP in the region.
-    bool isUnusedLiveThrough(unsigned I) const {
-      assert(I < Live.size() && "region index out of range");
-      return LiveIn[I] && LiveOut[I] && I != UseRegion;
+      if (Def == Other.Def) {
+        return InsertPt->getParent() < Other.InsertPt->getParent();
+      }
     }
 
-    /// Updates internal structures following a MI rematerialization. Part of
-    /// the stage instead of the DAG because it makes assumptions that are
-    /// specific to the rematerialization process.
-    void insertMI(unsigned RegionIdx, MachineInstr *RematMI,
-                  GCNScheduleDAGMILive &DAG) const;
-  };
+    return false;
+  }
 
-  /// A scored rematerialization candidate. Higher scores indicate more
-  /// beneficial rematerializations. A null score indicate the rematerialization
-  /// is not helpful to reduce RP in target regions.
-  struct ScoredRemat {
-    /// The rematerializable register under consideration.
-    RematReg *Remat;
+  RematCandidate(MachineInstr *Def, unsigned LoopCost, unsigned HighRPRegion,
+                 MachineBasicBlock::iterator InsertPt)
+      : Def(Def), LoopCost(LoopCost), InsertPt(InsertPt) {
+    HighRPRegions.insert(HighRPRegion);
+  }
 
-    /// Execution frequency information required by scoring heuristics.
-    /// Frequencies are scaled down if they are high to avoid overflow/underflow
-    /// when combining them.
-    struct FreqInfo {
-      /// Per-region execution frequencies. 0 when unknown.
-      SmallVector<uint64_t> Regions;
-      /// Minimum and maximum observed frequencies.
-      uint64_t MinFreq, MaxFreq;
+  RematCandidate(MachineInstr *Def, unsigned LoopCost,
+                 std::set<unsigned> HighRPRegions,
+                 MachineBasicBlock::iterator InsertPt)
+      : Def(Def), LoopCost(LoopCost), HighRPRegions(HighRPRegions),
+        InsertPt(InsertPt) {}
 
-      FreqInfo(MachineFunction &MF, const GCNScheduleDAGMILive &DAG);
+private:
+  friend Printable print(const RematCandidate R);
+};
 
-    private:
-      static const uint64_t ScaleFactor = 1024;
+class RematCandidates {
+private:
+  std::set<RematCandidate> Entries;
+  unsigned MaxLoopCost = 0;
+
+public:
+  using iterator = typename std::set<RematCandidate>::iterator;
+  using const_iterator = typename std::set<RematCandidate>::const_iterator;
+  using reverse_iterator = typename std::set<RematCandidate>::reverse_iterator;
+  using const_reverse_iterator =
+      typename std::set<RematCandidate>::const_reverse_iterator;
+
+  iterator begin() { return Entries.begin(); }
+  const_iterator begin() const { return Entries.begin(); }
+  iterator end() { return Entries.end(); }
+  const_iterator end() const { return Entries.end(); }
+
+  reverse_iterator rbegin() { return Entries.rbegin(); }
+  const_reverse_iterator rbegin() const { return Entries.rbegin(); }
+  reverse_iterator rend() { return Entries.rend(); }
+  const_reverse_iterator rend() const { return Entries.rend(); }
+
+  SmallVector<RematCandidate, 16> Sorted;
+  unsigned getDeferCostThreshold() { return MaxLoopCost; }
+
+  bool empty() const { return Entries.empty(); }
+
+  void insert(const RematCandidate &R) {
+    if (R.LoopCost > MaxLoopCost) {
+      MaxLoopCost = R.LoopCost;
+    }
+    Entries.insert(R);
+  }
+  void clear() { Entries.clear(); }
+
+  void sort(const LiveIntervals *LIS) {
+    std::set<RematCandidate> Cache = Entries;
+    SmallVector<RematCandidate, 8> Temps;
+    for (auto RCand : Entries) {
+      auto Def = RCand.Def;
+
+      bool FoundUse = false;
+      for (auto MO : Def->operands()) {
+        if (!MO.isReg() || !MO.isUse())
+          continue;
+
+        auto Reg = MO.getReg();
+
+        for (auto OtherCand : Entries) {
+          if (OtherCand.Def->definesRegister(Reg, nullptr)) {
+            FoundUse = true;
+            break;
+          }
+        }
+        if (FoundUse)
+          break;
+      }
+
+      if (!FoundUse) {
+        Temps.push_back(RCand);
+        Cache.erase(RCand);
+      }
+    }
+
+    std::sort(Temps.begin(), Temps.end(),
+              [LIS](RematCandidate A, RematCandidate B) {
+                auto R1 = A.Def->getOperand(0).getReg();
+                auto R2 = B.Def->getOperand(0).getReg();
+
+                if (R1 != R2)
+                  return R1 < R2;
+
+                auto P1 = A.InsertPt->getParent()->getNumber();
+                auto P2 = B.InsertPt->getParent()->getNumber();
+
+                if (P1 != P2)
+                  return P1 < P2;
+
+                return SlotIndex::isEarlierInstr(
+                    LIS->getInstructionIndex(*A.InsertPt),
+                    LIS->getInstructionIndex(*B.InsertPt));
+              });
+
+    Sorted.append(Temps);
+    Temps.clear();
+
+    Entries = Cache;
+
+    while (!Entries.empty()) {
+      Cache = Entries;
+
+      for (auto RCand : Entries) {
+        auto Def = RCand.Def;
+        bool FoundUse = false;
+        for (auto MO : Def->operands()) {
+          if (!MO.isReg() || !MO.isUse())
+            continue;
+
+          auto Reg = MO.getReg();
+
+          for (auto OtherCand : Entries) {
+            if (OtherCand.Def->definesRegister(Reg, nullptr)) {
+              FoundUse = true;
+              break;
+            }
+          }
+          if (FoundUse)
+            break;
+        }
+
+        if (!FoundUse) {
+          Temps.push_back(RCand);
+          Cache.erase(RCand);
+        }
+      }
+      std::sort(Temps.begin(), Temps.end(),
+                [LIS](RematCandidate A, RematCandidate B) {
+                  auto R1 = A.Def->getOperand(0).getReg();
+                  auto R2 = B.Def->getOperand(0).getReg();
+
+                  if (R1 != R2)
+                    return R1 < R2;
+
+                  auto P1 = A.InsertPt->getParent()->getNumber();
+                  auto P2 = B.InsertPt->getParent()->getNumber();
+
+                  if (P1 != P2)
+                    return P1 < P2;
+
+                  return SlotIndex::isEarlierInstr(
+                      LIS->getInstructionIndex(*A.InsertPt),
+                      LIS->getInstructionIndex(*B.InsertPt));
+                });
+
+      Sorted.append(Temps);
+      Temps.clear();
+      Entries = Cache;
+    }
+  }
+
+  bool hoistToDominator(MachineDominatorTree *PDT, MachineCycleInfo &CI,
+                        MachineBasicBlock *TargetBlock) {
+    DenseMap<MachineInstr *, SmallVector<RematCandidate, 4>> RematMap;
+
+    for (auto E : Entries) {
+      RematMap[E.Def].push_back(E);
+    }
+
+    auto isReachableFrom = [](MachineBasicBlock *A, MachineBasicBlock *B) {
+      std::set<MachineBasicBlock *> Visited;
+      std::list<MachineBasicBlock *> Worklist;
+
+      Worklist.push_back(A);
+
+      while (!Worklist.empty()) {
+        MachineBasicBlock *TheBlock = Worklist.front();
+        Worklist.pop_front();
+        if (TheBlock == B)
+          return true;
+        if (!Visited.insert(TheBlock).second)
+          continue;
+
+        for (auto BB : TheBlock->successors()) {
+          Worklist.push_back(BB);
+        }
+      }
+      return false;
     };
 
-    /// This only initializes state-independent characteristics of \p Remat, not
-    /// the actual score.
-    ScoredRemat(RematReg *Remat, const FreqInfo &Freq,
-                const GCNScheduleDAGMILive &DAG);
+    std::set<RematCandidate> Cache;
 
-    /// Rematerializes the candidate and returns the new MI. This removes the
-    /// rematerialized register from live-in/out lists in the \p DAG and updates
-    /// \p RPTargets in all affected regions. Regions in which RP savings are
-    /// not guaranteed are set in \p RecomputeRP.
-    MachineInstr *rematerialize(BitVector &RecomputeRP,
-                                SmallVectorImpl<GCNRPTarget> &RPTargets,
-                                GCNScheduleDAGMILive &DAG) const;
+    // errs() << "HoistToDominator\n";
+    for (auto RematInfo : RematMap) {
+      // errs() << "\nRemat Inst: "; RematInfo.first->dump();
+      std::set<unsigned> HighRPs;
+      SmallVector<MachineBasicBlock *> MBBs;
+      for (auto R : RematInfo.second) {
+        for (auto HRP : R.HighRPRegions) {
+          HighRPs.insert(HRP);
+        }
+        MBBs.push_back(R.InsertPt->getParent());
+        // errs() << "Has remat point in: " <<
+        // printMBBReference(*R.InsertPt->getParent()) << "\n";
+      }
 
-    /// Updates the rematerialization's score w.r.t. the current \p RPTargets.
-    /// \p RegionFreq indicates the frequency of each region
-    void update(const BitVector &TargetRegions, ArrayRef<GCNRPTarget> RPTargets,
-                const FreqInfo &Freq, bool ReduceSpill);
-
-    /// Returns whether the current score is null, indicating the
-    /// rematerialization is useless.
-    bool hasNullScore() const { return !RegionImpact; }
-
-    /// Compare score components of non-null scores pair-wise. A null score is
-    /// always strictly lesser than another non-null score.
-    bool operator<(const ScoredRemat &O) const {
-      if (hasNullScore())
-        return !O.hasNullScore();
-      if (O.hasNullScore())
-        return false;
-      if (MaxFreq != O.MaxFreq)
-        return MaxFreq < O.MaxFreq;
-      if (FreqDiff != O.FreqDiff)
-        return FreqDiff < O.FreqDiff;
-      if (RegionImpact != O.RegionImpact)
-        return RegionImpact < O.RegionImpact;
-      // Break ties using pointer to rematerializable register. Rematerializable
-      // registers are collected in instruction order so, within the same
-      // region, this will prefer registers defined earlier that have longer
-      // live ranges in their defining region (since the registers we consider
-      // are always live-out in their defining region).
-      return Remat > O.Remat;
+      auto DomBlock = PDT->findNearestCommonDominator(iterator_range(MBBs));
+      if (DomBlock && isReachableFrom(TargetBlock, DomBlock)) {
+        // errs() << "Found dom block: " << printMBBReference(*DomBlock) <<
+        // "\n";
+        RematCandidate New(RematInfo.first, CI.getCycleDepth(DomBlock), HighRPs,
+                           DomBlock->begin());
+        Cache.insert(New);
+      } else {
+        for (auto R : RematInfo.second) {
+          Cache.insert(R);
+        }
+      }
     }
 
-#if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
-    Printable print() const;
-#endif
+    // errs() << "Condensed: " << Entries.size() << " into: " << Cache.size() <<
+    // "\n";
+    Entries.clear();
+    Entries = Cache;
+    return true;
+  }
 
-  private:
-    /// Expected register pressure decrease induced by rematerializing this
-    /// candidate.
-    GCNRegPressure RPSave;
+  bool update(RematCandidate &RNew, const LiveIntervals *LIS) {
+    // errs() << "Update: "; RNew.Def->dump();
+    ////errs() << "Calling update for cand: ";
+    // RNew.Def->dump();
+    ////errs() << "With Regions: ";
+    // for (auto Regi : RNew.HighRPRegions) {
+    //   //errs() << Regi;
+    // }
+    ////errs() << "\n";
+    auto Match = find_if(Entries, [RNew](const RematCandidate &R) {
+      if (R.Def == RNew.Def) {
+        ////errs() << "equal defs for cand match: \n";
 
-    // The three members below are the scoring components, top to bottom from
-    // most important to least important when comparing candidates.
+        // R.Def->dump();
+        ////errs() << "With Regions: ";
+        // for (auto Regi : R.HighRPRegions) {
+        //   //errs() << Regi;
+        // }
+        ////errs() << "\n";
 
-    /// Frequency of impacted target region with highest known frequency. This
-    /// only matters when the stage is trying to reduce spilling, so it is
-    /// always 0 when it is not.
-    uint64_t MaxFreq;
-    /// Frequency difference between defining and using regions. Negative values
-    /// indicate we are rematerializing to higher frequency regions; positive
-    /// values indicate the contrary.
-    int64_t FreqDiff;
-    /// Expected number of target regions impacted by the rematerialization,
-    /// scaled by the size of the register being rematerialized.
-    unsigned RegionImpact;
+        ////errs() << "RNew parent: " << RNew.InsertPt->getParent()->getName()
+        ///<< "\n"; /errs() << "R parent: " <<
+        ///R.InsertPt->getParent()->getName() << "\n";
+      }
+      return R.Def == RNew.Def &&
+             RNew.InsertPt->getParent() == R.InsertPt->getParent();
+    });
+    if (Match != Entries.end()) {
+      RematCandidate *TheMatch = const_cast<RematCandidate *>(&*Match);
 
-    int64_t getFreqDiff(const FreqInfo &Freq) const;
-  };
+      for (auto NewRegion : RNew.HighRPRegions)
+        TheMatch->HighRPRegions.insert(NewRegion);
 
-  /// Parent MBB to each region, in region order.
-  SmallVector<MachineBasicBlock *> RegionBB;
-  /// Register pressure targets for all regions.
-  SmallVector<GCNRPTarget> RPTargets;
-  /// Regions which are above the stage's RP target.
-  BitVector TargetRegions;
-  /// The target occupancy the set is trying to achieve. Empty when the
+      if (SlotIndex::isEarlierInstr(
+              LIS->getInstructionIndex(*RNew.InsertPt).getRegSlot(),
+              LIS->getInstructionIndex(*Match->InsertPt).getRegSlot())) {
+
+        if (RNew.InsertPt != RNew.InsertPt->getParent()->begin())
+          TheMatch->InsertPt = &*std::prev(RNew.InsertPt);
+        else {
+          TheMatch->InsertPt = RNew.InsertPt;
+        }
+
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool updateOrInsert(RematCandidate &RNew, const LiveIntervals *LIS) {
+    if (!update(RNew, LIS)) {
+      insert(RNew);
+    }
+
+    return true;
+  }
+
+  void resolveSameBlockUses(const MachineRegisterInfo *MRI,
+                            const LiveIntervals *LIS) {
+    // errs() << "\nResolve Same Block uses";
+    // We may have added remat candidates which are used by other remat
+    // candidates -- be sure that we have correct insert points for this
+    bool FixedPoint = false;
+    while (!FixedPoint) {
+      // errs() << "Fixed Point iter\n";
+      //  //errs() << "Doling fixed point\n";
+      FixedPoint = true;
+      for (auto &RematEntry : Entries) {
+
+        MachineInstr *RematInst = RematEntry.Def;
+        // errs() << "R: "; RematInst->dump();
+        // errs() << "For Regions: ";
+        // errs() << "\n";
+        MachineBasicBlock::iterator RematPt = RematEntry.InsertPt;
+        // for (auto RematInst : RematEntry.second) {
+        //   //errs() << "Have Remat Inst: "; RematInst.first->dump();
+        // //errs() << "With Insert Point: " <<
+        // DAG.LIS->getInstructionIndex(*RematInst.second) << "\n";
+        for (auto MO : RematInst->operands()) {
+          if (!MO.isReg() || !MO.getReg() || !MO.readsReg())
+            continue;
+          auto UseReg = MO.getReg();
+          if (!UseReg.isVirtual())
+            continue;
+          // //errs() << "Found UseReg: " << printReg(UseReg) << "\n";
+          for (MachineInstr &DefInst : MRI->def_instructions(UseReg)) {
+
+            auto Match =
+                find_if(Entries, [&DefInst, &RematPt](const RematCandidate &R) {
+                  return R.Def == &DefInst &&
+                         RematPt->getParent() == R.InsertPt->getParent();
+                });
+
+            if (Match == Entries.end())
+              continue;
+
+            RematCandidate R(&DefInst, 0, RematEntry.HighRPRegions, RematPt);
+            bool MadeChange = update(R, LIS);
+            if (MadeChange)
+              FixedPoint = false;
+          }
+        }
+        //}
+      }
+    }
+  }
+
+  RematCandidates() {}
+  RematCandidates(std::set<RematCandidate> &Entries) : Entries(Entries) {}
+};
+
+class PreRARematStage : public GCNSchedStage {
+private:
+  // Each region at MinOccupancy will have their own list of trivially
+  // rematerializable instructions we can remat to reduce RP. The list maps an
+  // instruction to the position we should remat before, usually the MI using
+  // the rematerializable instruction.
+  MapVector<unsigned, MapVector<MachineInstr *, MachineInstr *>>
+      RematerializableInsts;
+
+  RematCandidates Cands;
+
+  RematCandidates RematPlan;
+
+  DenseMap<MachineInstr *, SmallPtrSet<MachineBasicBlock *, 16>> ToDelete;
+
+  BitVector RelevantRegions;
+
+  // Map a trivially rematerializable def to a list of regions at MinOccupancy
+  // that has the defined reg as a live-in.
+  DenseMap<MachineInstr *, SmallVector<unsigned, 4>> RematDefToLiveInRegions;
+
+  DenseMap<unsigned, int> OptRegionRPReduction;
+
+  MachineCycleInfo CI;
+  MachineDominatorTree PDT;
+
+  MachineBasicBlock *TargetBlock = nullptr;
+
+  unsigned LiveThruBias = 40;
+  unsigned LiveInBias = 3;
+
+  BitVector RescheduleRegions;
+  /// The target occupancy the stage is trying to achieve. Empty when the
   /// objective is spilling reduction.
   std::optional<unsigned> TargetOcc;
   /// Achieved occupancy *only* through rematerializations (pre-rescheduling).
+  /// Smaller than or equal to the target occupancy.
   unsigned AchievedOcc;
-  /// After successful stage initialization, indicates which regions should be
-  /// rescheduled.
-  BitVector RescheduleRegions;
 
-  /// List of rematerializable registers.
-  SmallVector<RematReg> RematRegs;
+  bool canRemat(Register Reg);
 
-  /// Holds enough information to rollback a rematerialization decision post
-  /// re-scheduling.
-  struct RollbackInfo {
-    /// The rematerializable register under consideration.
-    const RematReg *Remat;
-    /// The rematerialized MI replacing the original defining MI.
-    MachineInstr *RematMI;
-    /// Maps register machine operand indices to their original register.
-    SmallDenseMap<unsigned, Register, 4> RegMap;
+  void collectRematSeeds(bool Aggressive = false);
 
-    RollbackInfo(const RematReg *Remat) : Remat(Remat) {}
-  };
-  /// List of rematerializations to rollback if rematerialization does not end
-  /// up being beneficial.
-  SmallVector<RollbackInfo> Rollbacks;
+  bool createRematPlan(bool Aggressive = false);
 
-  /// State of a region pre-re-scheduling but post-rematerializations that we
-  /// must keep to be able to revert re-scheduling effects.
-  struct RegionSchedRevert {
-    /// Region number;
-    unsigned RegionIdx;
-    /// Original instruction order (both debug and non-debug MIs).
-    std::vector<MachineInstr *> OrigMIOrder;
-    /// Maximum pressure recorded in the region.
-    GCNRegPressure MaxPressure;
+  bool implementRematPlan(const TargetInstrInfo *TII, bool Aggressive = false);
 
-    RegionSchedRevert(unsigned RegionIdx, ArrayRef<MachineInstr *> OrigMIOrder,
-                      const GCNRegPressure &MaxPressure)
-        : RegionIdx(RegionIdx), OrigMIOrder(OrigMIOrder),
-          MaxPressure(MaxPressure) {}
-  };
-  /// After re-scheduling, contains pre-re-scheduling data for all re-scheduled
-  /// regions.
-  SmallVector<RegionSchedRevert> RegionReverts;
+  bool isTriviallyReMaterializable(const MachineInstr &MI);
 
-  /// Returns the occupancy the stage is trying to achieve.
-  unsigned getStageTargetOccupancy() const;
+  bool eliminateDeadMI();
+  bool isDead(MachineInstr *MI);
 
-  /// Determines the stage's objective (increasing occupancy or reducing
-  /// spilling, set in \ref TargetOcc). Defines \ref RPTargets in all regions to
-  /// achieve that objective and mark those that don't achieve it in \ref
-  /// TargetRegions. Returns whether there is any target region.
-  bool setObjective();
+  bool isReachableFrom(MachineBasicBlock *A, MachineBasicBlock *B) {
+    std::set<MachineBasicBlock *> Visited;
+    std::list<MachineBasicBlock *> Worklist;
 
-  /// Unsets target regions in \p Regions whose RP target has been reached.
-  void unsetSatisfiedRPTargets(const BitVector &Regions);
+    Worklist.push_back(A);
 
-  /// Fully recomputes RP from the DAG in \p Regions. Among those regions, sets
-  /// again all \ref TargetRegions that were optimistically marked as satisfied
-  /// but are actually not, and returns whether there were any such regions.
-  bool updateAndVerifyRPTargets(const BitVector &Regions);
+    while (!Worklist.empty()) {
+      MachineBasicBlock *TheBlock = Worklist.front();
+      Worklist.pop_front();
+      if (TheBlock == B)
+        return true;
+      if (!Visited.insert(TheBlock).second)
+        continue;
 
-  /// Collects all rematerializable registers and appends them to \ref
-  /// RematRegs. \p MIRegion maps MIs to their region. Returns whether any
-  /// rematerializable register was found.
-  bool collectRematRegs(const DenseMap<MachineInstr *, unsigned> &MIRegion);
-
-  /// Deletes all rematerialized MIs from the MIR when they were kept around for
-  /// potential rollback.
-  void commitRematerializations() const;
-
-  /// Whether the MI is rematerializable
-  bool isReMaterializable(const MachineInstr &MI);
-
-  /// If remat alone did not increase occupancy to the target one, rollbacks all
-  /// rematerializations and resets live-ins/RP in all regions impacted by the
-  /// stage to their pre-stage values.
-  void finalizeGCNSchedStage() override;
+      for (auto BB : TheBlock->successors()) {
+        Worklist.push_back(BB);
+      }
+    }
+    return false;
+  }
 
 public:
   bool initGCNSchedStage() override;
 
   bool initGCNRegion() override;
 
-  void finalizeGCNRegion() override;
-
   bool shouldRevertScheduling(unsigned WavesAfter) override;
 
   PreRARematStage(GCNSchedStageID StageID, GCNScheduleDAGMILive &DAG)
-      : GCNSchedStage(StageID, DAG), TargetRegions(DAG.Regions.size()),
-        RescheduleRegions(DAG.Regions.size()) {
-    const unsigned NumRegions = DAG.Regions.size();
-    RPTargets.reserve(NumRegions);
-    RegionBB.reserve(NumRegions);
-  }
+      : GCNSchedStage(StageID, DAG), RescheduleRegions(DAG.Regions.size()) {}
 };
 
 class ILPInitialScheduleStage : public GCNSchedStage {
@@ -783,6 +1010,25 @@ public:
       : GCNSchedStage(StageID, DAG) {}
 };
 
+class GCNPostSchedStrategy : public PostGenericScheduler {
+protected:
+  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand) override;
+
+  SUnit *pickNode(bool &IsTopNode) override;
+
+  // If the XDL resource is not occupied, try to schedule a ready MFMA,
+  // otherwise, try not to stall XDL.
+  bool tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand);
+
+public:
+  // Processor resource for XDL.
+  ProcRes XDLProcRes;
+
+  bool CustomResTracking = false;
+
+  GCNPostSchedStrategy(const MachineSchedContext *C);
+};
+
 class GCNPostScheduleDAGMILive final : public ScheduleDAGMI {
 private:
   std::vector<std::unique_ptr<ScheduleDAGMutation>> SavedMutations;
@@ -790,6 +1036,8 @@ private:
   bool HasIGLPInstrs = false;
 
 public:
+  GCNPostSchedStrategy *S = nullptr;
+
   void schedule() override;
 
   void finalizeSchedule() override;
