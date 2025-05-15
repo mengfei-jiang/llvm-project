@@ -110,6 +110,11 @@ static cl::opt<bool> DisableRemat(
 static cl::opt<bool> DisableRewriteMFMAFormSchedStage(
     "amdgpu-disable-rewrite-mfma-form-sched-stage", cl::Hidden,
     cl::desc("Disable rewrie mfma rewrite scheduling stage"), cl::init(true));
+static cl::opt<bool> DisableRemat(
+    "amdgpu-disable-remat", cl::Hidden,
+    cl::desc("Disable rematerialization during AMDGPU scheduling)"),
+    cl::init(false));
+
 
 const unsigned ScheduleMetrics::ScaleFactor = 100;
 
