@@ -118,6 +118,7 @@ static cl::opt<bool> DisableRemat(
     cl::init(false));
 
 
+<<<<<<< HEAD
 static cl::opt<bool> DisableRewriteMFMAFormSchedStage(
     "amdgpu-disable-rewrite-mfma-form-sched-stage", cl::Hidden,
     cl::desc("Disable rewrie mfma rewrite scheduling stage"), cl::init(true));
@@ -127,6 +128,8 @@ static cl::opt<bool> DisableRemat(
     cl::init(false));
 
 
+=======
+>>>>>>> 095a216a36c6 (switching)
 const unsigned ScheduleMetrics::ScaleFactor = 100;
 
 GCNSchedStrategy::GCNSchedStrategy(const MachineSchedContext *C)
