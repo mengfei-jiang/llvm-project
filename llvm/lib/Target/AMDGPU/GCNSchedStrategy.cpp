@@ -464,6 +464,19 @@ void GCNSchedStrategy::pickNodeFromQueue(SchedBoundary &Zone,
   }
 }
 
+static bool canUnpack(const MachineInstr *MI) {
+  if (!MI)
+    return false;
+  switch (MI->getOpcode()) {
+  case AMDGPU::V_PK_ADD_F32:
+  case AMDGPU::V_PK_MUL_F32:
+  case AMDGPU::V_PK_FMA_F32:
+    return true;
+  default:
+    return false;
+  }
+}
+
 // This function is mostly cut and pasted from
 // GenericScheduler::pickNodeBidirectional()
 SUnit *GCNSchedStrategy::pickNodeBidirectional(bool &IsTopNode,
@@ -635,6 +648,10 @@ SUnit *GCNSchedStrategy::pickNode(bool &IsTopNode) {
     bool IsXDL = MI ? TII->isXDL(*SU->getInstr()) : false;
     bool IsALU = MI ? TII->isVALU(*SU->getInstr()) || TII->isSALU(*SU->getInstr()) : false;
     unsigned Cycles = SU->Latency;
+    // Assume that an instruction will be unpacked when XDL resource is busy.
+    if (canUnpack(MI))
+      Cycles += 1;
+
     if (IsXDL) {
       // FIXME: Hack since XDL is only actually occupying for 24 cycles with 8
       // pass MFMA.
@@ -3054,6 +3071,11 @@ SUnit *GCNPostSchedStrategy::pickNode(bool &IsTopNode) {
     bool IsXDL = MI ? TII->isXDL(*SU->getInstr()) : false;
     bool IsALU = MI ? TII->isVALU(*SU->getInstr()) || TII->isSALU(*SU->getInstr()) : false;
     unsigned Cycles = SU->Latency;
+
+    // Assume that an instruction will be unpacked when XDL resource is busy.
+    if (canUnpack(MI))
+      Cycles += 1;
+
     if (IsXDL) {
       // FIXME: Hack since XDL is only actually occupying for 24 cycles with 8
       // pass MFMA.
