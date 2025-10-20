@@ -104,7 +104,7 @@ static cl::opt<bool>
     RematLiveThru("amdgpu-remat-livethru", cl::Hidden,
                   cl::desc("Rematerialize the LiveThru registers for the first "
                            "loop found in the code"),
-                  cl::init(false));
+                  cl::init(true));
 
 static cl::opt<bool> RematLiveIn(
     "amdgpu-remat-into", cl::Hidden,
@@ -112,13 +112,6 @@ static cl::opt<bool> RematLiveIn(
              "the code (may rematerialize into body of loop)"),
     cl::init(false));
 
-static cl::opt<bool> DisableRemat(
-    "amdgpu-disable-remat", cl::Hidden,
-    cl::desc("Disable rematerialization during AMDGPU scheduling)"),
-    cl::init(false));
-
-
-<<<<<<< HEAD
 static cl::opt<bool> DisableRewriteMFMAFormSchedStage(
     "amdgpu-disable-rewrite-mfma-form-sched-stage", cl::Hidden,
     cl::desc("Disable rewrie mfma rewrite scheduling stage"), cl::init(true));
@@ -128,8 +121,6 @@ static cl::opt<bool> DisableRemat(
     cl::init(false));
 
 
-=======
->>>>>>> 095a216a36c6 (switching)
 const unsigned ScheduleMetrics::ScaleFactor = 100;
 
 GCNSchedStrategy::GCNSchedStrategy(const MachineSchedContext *C)
@@ -487,47 +478,6 @@ void GCNSchedStrategy::pickNodeFromQueue(SchedBoundary &Zone,
   }
 }
 
-static bool canUnpack(const MachineInstr *MI) {
-  if (!MI)
-    return false;
-  switch (MI->getOpcode()) {
-  case AMDGPU::V_PK_ADD_F32:
-  case AMDGPU::V_PK_MUL_F32:
-  case AMDGPU::V_PK_FMA_F32:
-    return true;
-  default:
-    return false;
-  }
-}
-
-static bool tryPreferNonUnpackable(
-    bool CustomResTracking, const ProcRes &XDLProcRes,
-    GenericScheduler::SchedCandidate &Cand,
-    GenericScheduler::SchedCandidate &TryCand) {
-  if (!CustomResTracking || XDLProcRes.CyclesReserved == 0)
-    return false;
-
-  if (!Cand.SU || !TryCand.SU)
-    return false;
-
-  MachineInstr *CandMI = Cand.SU->getInstr();
-  MachineInstr *TryMI = TryCand.SU->getInstr();
-  if (!CandMI || !TryMI)
-    return false;
-
-  bool CandCanUnpack = canUnpack(CandMI);
-  bool TryCanUnpack = canUnpack(TryMI);
-  if (CandCanUnpack == TryCanUnpack)
-    return false;
-
-  if (!TryCanUnpack)
-    TryCand.Reason = GenericSchedulerBase::ResourceReduce;
-  else
-    Cand.Reason = GenericSchedulerBase::ResourceReduce;
-
-  return true;
-}
-
 // This function is mostly cut and pasted from
 // GenericScheduler::pickNodeBidirectional()
 SUnit *GCNSchedStrategy::pickNodeBidirectional(bool &IsTopNode,
@@ -695,27 +645,17 @@ SUnit *GCNSchedStrategy::pickNode(bool &IsTopNode) {
 #endif
 
     const SIInstrInfo *TII = static_cast<const SIInstrInfo *>(DAG->TII);
-    MachineInstr *MI = SU->getInstr();
-    bool IsXDL = MI ? TII->isXDL(*SU->getInstr()) : false;
-    bool IsALU = MI ? TII->isVALU(*SU->getInstr()) || TII->isSALU(*SU->getInstr()) : false;
+    bool IsXDL = TII->isXDL(*SU->getInstr());
     unsigned Cycles = SU->Latency;
-    // Assume that an instruction will be unpacked when XDL resource is busy.
-    if (canUnpack(MI))
-      Cycles += 1;
-
     if (IsXDL) {
       // FIXME: Hack since XDL is only actually occupying for 24 cycles with 8
       // pass MFMA.
-      if (Cycles > 2) {
-        const GCNSubtarget &ST = MF->getSubtarget<GCNSubtarget>();
-        Cycles -= ST.hasGFX950Insts() ? 2 : 1;
-      }
+      if (Cycles > 2)
+        Cycles -= 2;
       XDLProcRes.reset();
       XDLProcRes.reserve(Cycles);
-    } else if (IsALU) {
-      XDLProcRes.release(Cycles);
     } else {
-      XDLProcRes.release(1);
+      XDLProcRes.release(Cycles);
     }
 
     LLVM_DEBUG(dbgs() << "OldXDLProcRes: " << XDLCyclesBefore
@@ -835,9 +775,6 @@ bool GCNMaxOccupancySchedStrategy::tryCandidate(SchedCandidate &Cand,
         !Rem.IsAcyclicLatencyLimited && tryLatency(TryCand, Cand, *Zone))
       return TryCand.Reason != NoCand;
 
-    if (tryPreferNonUnpackable(CustomResTracking, XDLProcRes, Cand, TryCand))
-      return TryCand.Reason != GenericSchedulerBase::NoCand;
-
     // Fall through to original instruction order.
     if ((Zone->isTop() && TryCand.SU->NodeNum < Cand.SU->NodeNum) ||
         (!Zone->isTop() && TryCand.SU->NodeNum > Cand.SU->NodeNum)) {
@@ -924,19 +861,6 @@ GCNMaxOccupancySchedStrategy::GCNMaxOccupancySchedStrategy(
   SchedStages.push_back(GCNSchedStageID::UnclusteredHighRPReschedule);
   SchedStages.push_back(GCNSchedStageID::ClusteredLowOccupancyReschedule);
   if (!DisableRemat) SchedStages.push_back(GCNSchedStageID::PreRARematerialize);
-
-  CI.clear();
-  CI.compute(*C->MF);
-
-  unsigned CycleCount = 0;
-  for (auto C : CI.toplevel_cycles()) {
-    ++CycleCount;
-  }
-  if (CycleCount >= 2) {
-    GCNTrackers = true;
-    RematLiveThru = true;
-  }
-
   GCNTrackers = GCNTrackers & !IsLegacyScheduler;
 }
 
@@ -1041,11 +965,7 @@ bool GCNSchedStrategy::tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand,
                               SchedBoundary *Zone) const {
   assert(Zone->isTop());
   MachineInstr *CInst = Cand.SU->getInstr();
-  if (!CInst)
-    return false;
   MachineInstr *TCInst = TryCand.SU->getInstr();
-  if (!TCInst)
-    return false;
   const SIInstrInfo *TII = DAG->MF.getSubtarget<GCNSubtarget>().getInstrInfo();
 
   bool CandIsXDL = TII->isXDL(*CInst);
@@ -1082,10 +1002,7 @@ bool GCNSchedStrategy::tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand,
         if (!CandSeenSuccs.insert(SuccSU).second)
           continue;
 
-        MachineInstr *SuccMI = SuccSU->getInstr();
-        if (!SuccMI)
-          continue;
-        if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+        if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
           ++CandReadyVALUSuccs;
         }
       }
@@ -1096,10 +1013,7 @@ bool GCNSchedStrategy::tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand,
         if (!TrySeenSuccs.insert(SuccSU).second)
           continue;
 
-        MachineInstr *SuccMI = SuccSU->getInstr();
-        if (!SuccMI)
-          continue;
-        if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+        if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
           ++TryReadyVALUSuccs;
         }
       }
@@ -1135,10 +1049,7 @@ bool GCNSchedStrategy::tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand,
         SUnit *SuccSU = Succ.getSUnit();
         if (!CandSeenSuccs.insert(SuccSU).second)
           continue;
-        MachineInstr *SuccMI = SuccSU->getInstr();
-        if (!SuccMI)
-          continue;
-        if (TII->isVALU(*SuccMI))
+        if (TII->isVALU(*SuccSU->getInstr()))
           ++CandVALUSuccs;
       }
 
@@ -1146,10 +1057,7 @@ bool GCNSchedStrategy::tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand,
         SUnit *SuccSU = Succ.getSUnit();
         if (!TrySeenSuccs.insert(SuccSU).second)
           continue;
-        MachineInstr *SuccMI = SuccSU->getInstr();
-        if (!SuccMI)
-          continue;
-        if (TII->isVALU(*SuccMI))
+        if (TII->isVALU(*SuccSU->getInstr()))
           ++TryVALUSuccs;
       }
 
@@ -1191,10 +1099,7 @@ bool GCNSchedStrategy::tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand,
       if (!CandSeenSuccs.insert(SuccSU).second)
         continue;
 
-      MachineInstr *SuccMI = SuccSU->getInstr();
-      if (!SuccMI)
-        continue;
-      if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+      if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
         ++CandReadyVALUSuccs;
       }
     }
@@ -1205,10 +1110,7 @@ bool GCNSchedStrategy::tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand,
       if (!TrySeenSuccs.insert(SuccSU).second)
         continue;
 
-      MachineInstr *SuccMI = SuccSU->getInstr();
-      if (!SuccMI)
-        continue;
-      if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+      if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
         ++TryReadyVALUSuccs;
       }
     }
@@ -1247,10 +1149,7 @@ bool GCNSchedStrategy::tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand,
       if (!CandSeenSuccs.insert(SuccSU).second)
         continue;
 
-      MachineInstr *SuccMI = SuccSU->getInstr();
-      if (!SuccMI)
-        continue;
-      if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+      if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
         ++CandReadyVALUSuccs;
       }
     }
@@ -1261,10 +1160,7 @@ bool GCNSchedStrategy::tryXDL(SchedCandidate &Cand, SchedCandidate &TryCand,
       if (!TrySeenSuccs.insert(SuccSU).second)
         continue;
 
-      MachineInstr *SuccMI = SuccSU->getInstr();
-      if (!SuccMI)
-        continue;
-      if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+      if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
         ++TryReadyVALUSuccs;
       }
     }
@@ -2020,9 +1916,6 @@ bool PreRARematStage::initGCNSchedStage() {
   // need to be fixed if there is another pass after this pass.
   assert(!S.hasNextStage());
 
-  SIRegisterInfo *SRI = const_cast<SIRegisterInfo *>(
-      static_cast<const SIRegisterInfo *>(DAG.TRI));
-  SRI->setLocalAssignment(true);
   CI.clear();
   CI.compute(MF);
   PDT.recalculate(MF);
@@ -3832,28 +3725,17 @@ SUnit *GCNPostSchedStrategy::pickNode(bool &IsTopNode) {
 #endif
 
     const SIInstrInfo *TII = static_cast<const SIInstrInfo *>(DAG->TII);
-    MachineInstr *MI = SU->getInstr();
-    bool IsXDL = MI ? TII->isXDL(*SU->getInstr()) : false;
-    bool IsALU = MI ? TII->isVALU(*SU->getInstr()) || TII->isSALU(*SU->getInstr()) : false;
+    bool IsXDL = TII->isXDL(*SU->getInstr());
     unsigned Cycles = SU->Latency;
-
-    // Assume that an instruction will be unpacked when XDL resource is busy.
-    if (canUnpack(MI))
-      Cycles += 1;
-
     if (IsXDL) {
       // FIXME: Hack since XDL is only actually occupying for 24 cycles with 8
       // pass MFMA.
-      if (Cycles > 2) {
-        const GCNSubtarget &ST = DAG->MF.getSubtarget<GCNSubtarget>();
-        Cycles -= ST.hasGFX950Insts() ? 2 : 1;
-      }
+      if (Cycles > 2)
+        Cycles -= 2;
       XDLProcRes.reset();
       XDLProcRes.reserve(Cycles);
-    } else if (IsALU) {
-      XDLProcRes.release(Cycles);
     } else {
-      XDLProcRes.release(1);
+      XDLProcRes.release(Cycles);
     }
 
     LLVM_DEBUG(dbgs() << "OldXDLProcRes: " << XDLCyclesBefore
@@ -3869,11 +3751,7 @@ SUnit *GCNPostSchedStrategy::pickNode(bool &IsTopNode) {
 bool GCNPostSchedStrategy::tryXDL(SchedCandidate &Cand,
                                   SchedCandidate &TryCand) {
   MachineInstr *CInst = Cand.SU->getInstr();
-  if (!CInst)
-    return false;
   MachineInstr *TCInst = TryCand.SU->getInstr();
-  if (!TCInst)
-    return false;
   const SIInstrInfo *TII = DAG->MF.getSubtarget<GCNSubtarget>().getInstrInfo();
 
   bool CandIsXDL = TII->isXDL(*CInst);
@@ -3910,10 +3788,7 @@ bool GCNPostSchedStrategy::tryXDL(SchedCandidate &Cand,
         if (!CandSeenSuccs.insert(SuccSU).second)
           continue;
 
-        MachineInstr *SuccMI = SuccSU->getInstr();
-        if (!SuccMI)
-          continue;
-        if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+        if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
           ++CandReadyVALUSuccs;
         }
       }
@@ -3924,10 +3799,7 @@ bool GCNPostSchedStrategy::tryXDL(SchedCandidate &Cand,
         if (!TrySeenSuccs.insert(SuccSU).second)
           continue;
 
-        MachineInstr *SuccMI = SuccSU->getInstr();
-        if (!SuccMI)
-          continue;
-        if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+        if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
           ++TryReadyVALUSuccs;
         }
       }
@@ -3963,10 +3835,7 @@ bool GCNPostSchedStrategy::tryXDL(SchedCandidate &Cand,
         SUnit *SuccSU = Succ.getSUnit();
         if (!CandSeenSuccs.insert(SuccSU).second)
           continue;
-        MachineInstr *SuccMI = SuccSU->getInstr();
-        if (!SuccMI)
-          continue;
-        if (TII->isVALU(*SuccMI))
+        if (TII->isVALU(*SuccSU->getInstr()))
           ++CandVALUSuccs;
       }
 
@@ -3974,10 +3843,7 @@ bool GCNPostSchedStrategy::tryXDL(SchedCandidate &Cand,
         SUnit *SuccSU = Succ.getSUnit();
         if (!TrySeenSuccs.insert(SuccSU).second)
           continue;
-        MachineInstr *SuccMI = SuccSU->getInstr();
-        if (!SuccMI)
-          continue;
-        if (TII->isVALU(*SuccMI))
+        if (TII->isVALU(*SuccSU->getInstr()))
           ++TryVALUSuccs;
       }
 
@@ -4019,10 +3885,7 @@ bool GCNPostSchedStrategy::tryXDL(SchedCandidate &Cand,
       if (!CandSeenSuccs.insert(SuccSU).second)
         continue;
 
-      MachineInstr *SuccMI = SuccSU->getInstr();
-      if (!SuccMI)
-        continue;
-      if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+      if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
         ++CandReadyVALUSuccs;
       }
     }
@@ -4033,10 +3896,7 @@ bool GCNPostSchedStrategy::tryXDL(SchedCandidate &Cand,
       if (!TrySeenSuccs.insert(SuccSU).second)
         continue;
 
-      MachineInstr *SuccMI = SuccSU->getInstr();
-      if (!SuccMI)
-        continue;
-      if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+      if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
         ++TryReadyVALUSuccs;
       }
     }
@@ -4075,10 +3935,7 @@ bool GCNPostSchedStrategy::tryXDL(SchedCandidate &Cand,
       if (!CandSeenSuccs.insert(SuccSU).second)
         continue;
 
-      MachineInstr *SuccMI = SuccSU->getInstr();
-      if (!SuccMI)
-        continue;
-      if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+      if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
         ++CandReadyVALUSuccs;
       }
     }
@@ -4089,10 +3946,7 @@ bool GCNPostSchedStrategy::tryXDL(SchedCandidate &Cand,
       if (!TrySeenSuccs.insert(SuccSU).second)
         continue;
 
-      MachineInstr *SuccMI = SuccSU->getInstr();
-      if (!SuccMI)
-        continue;
-      if (TII->isVALU(*SuccMI) && SuccSU->NumPredsLeft == 1) {
+      if (TII->isVALU(*SuccSU->getInstr()) && SuccSU->NumPredsLeft == 1) {
         ++TryReadyVALUSuccs;
       }
     }
@@ -4197,9 +4051,6 @@ bool GCNPostSchedStrategy::tryCandidate(SchedCandidate &Cand,
         tryLatency(TryCand, Cand, Cand.AtTop ? Top : Bot))
       return TryCand.Reason != NoCand;
   }
-
-  if (tryPreferNonUnpackable(CustomResTracking, XDLProcRes, Cand, TryCand))
-    return TryCand.Reason != GenericSchedulerBase::NoCand;
 
   // Fall through to original instruction order.
   if (TryCand.SU->NodeNum < Cand.SU->NodeNum) {
